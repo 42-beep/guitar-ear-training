@@ -2007,15 +2007,93 @@ E|-----------|"></textarea>
     return out;
   }
 
+  // ---- 先看文件里到底是什么编码，再决定要不要送去解码 ----
+  // 很多 .m4a 其实是 av3a（AVS3，网易云那套），浏览器没有解码器，
+  // 直接丢给 decodeAudioData 只会得到一句没头没脑的“解不开”。
+  var CODEC_INFO = {
+    'av3a': ['AVS3（av3a）', '这是网易云音乐等平台用的国产压缩格式，浏览器里没有解码器。'],
+    'alac': ['ALAC（苹果无损）', 'Chrome / Edge 不支持 ALAC 无损。'],
+    'ac-3': ['杜比 AC-3', '浏览器不支持杜比环绕声轨。'],
+    'ec-3': ['杜比 E-AC-3', '浏览器不支持杜比环绕声轨。'],
+    'samr': ['AMR 语音', '这是手机录音格式，音质太低也不能用。'],
+    'dtsc': ['DTS', '浏览器不支持 DTS 音轨。']
+  };
+
+  function sniffAudioCodec(ab){
+    var d = new Uint8Array(ab);
+    var dv = new DataView(ab);
+    var tag = '';
+    function cc(o, n){
+      n = n || 4;
+      var s = '';
+      for (var k = 0; k < n; k++) s += String.fromCharCode(d[o + k]);
+      return s;
+    }
+    function walk(off, end){
+      while (!tag && off + 8 <= end){
+        var sz = dv.getUint32(off);
+        var t = cc(off + 4);
+        var hdr = 8;
+        if (sz === 1){
+          if (off + 16 > end) return;
+          sz = Number(dv.getBigUint64(off + 8));
+          hdr = 16;
+        }
+        if (sz < 8 || off + sz > end) return;
+        if (t === 'stsd'){
+          tag = cc(off + hdr + 12);
+          return;
+        }
+        if (t === 'moov' || t === 'trak' || t === 'mdia' || t === 'minf' || t === 'stbl'){
+          walk(off + hdr, off + sz);
+        }
+        off += sz;
+      }
+    }
+    try {
+      if (d.length > 12 && cc(0, 4) === 'RIFF') return 'wav';
+      if (d.length > 4 && cc(0, 4) === 'fLaC') return 'flac';
+      if (d.length > 4 && cc(0, 4) === 'OggS') return 'ogg';
+      if (d.length > 4 && cc(0, 4) === 'FORM') return 'aiff';
+      // mp3：跳过可能存在的 ID3 标签后找帧同步
+      if (d.length > 10 && cc(0, 3) === 'ID3'){
+        var skip = 10 + ((d[6] & 0x7f) << 21 | (d[7] & 0x7f) << 14 | (d[8] & 0x7f) << 7 | (d[9] & 0x7f));
+        if (d[skip] === 0xFF && (d[skip+1] & 0xE0) === 0xE0) return 'mp3';
+      }
+      if (d[0] === 0xFF && (d[1] & 0xE0) === 0xE0) return 'mp3';
+      if (d.length > 8 && cc(4) === 'ftyp') walk(0, d.length);
+    } catch (e){}
+    return tag;
+  }
+
   function handleAudioFile(file){
     var ctx = audioCtx();
-    $('#audioMeta').textContent = '正在解码…';
+    $('#audioMeta').textContent = '正在读取…';
     var reader = new FileReader();
     reader.onload = function(){
-      ctx.decodeAudioData(reader.result, function(buf){
+      var ab = reader.result;
+      var tag = '';
+      try { tag = sniffAudioCodec(ab); } catch (e){ tag = ''; }
+      var bad = CODEC_INFO[tag];
+      if (bad){
+        $('#audioMeta').textContent = '编码是 ' + bad[0] + '，解不开';
+        alert('这个文件解不开，原因不在文件坏了 —— 是它的音频编码浏览器不认。\n\n' +
+              '文件实际编码：' + bad[0] + '\n' + bad[1] + '\n\n' +
+              '两个办法：\n' +
+              '1. 回原平台重新下载，音质选「标准 / MP3」（网易云的 m4a 常是 av3a）；\n' +
+              '2. 用格式转换工具转成 mp3 或 wav，再拖进来。');
+        return;
+      }
+      $('#audioMeta').textContent = '正在解码…';
+      ctx.decodeAudioData(ab, function(buf){
         startAnalysis(buf, file.name);
       }, function(){
         $('#audioMeta').textContent = '这个文件解不开，换 mp3 或 wav 试试。';
+        var known = { mp3: 1, wav: 1, flac: 1, ogg: 1, aiff: 1, mp4a: 1 };
+        alert('解码失败。\n\n' +
+              (tag && !known[tag] ? '检测到的编码是「' + tag + '」，浏览器可能不支持。\n\n' : '') +
+              '能用的格式：mp3 / wav / flac / ogg / aac。\n' +
+              '如果原文件是 m4a 却打不开，多半里面的编码不是 AAC，转成 mp3 就行。');
       });
     };
     reader.readAsArrayBuffer(file);
