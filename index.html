@@ -224,9 +224,15 @@ E|-----------|"></textarea>
       <h2>上传音频</h2>
       <div class="drop" id="drop">
         <div class="big">点这里选文件，或把音频拖进来</div>
-        <div class="hint">支持 mp3 / wav / m4a / ogg · 整首歌丢进来就行，会挑出最连贯的那条主旋律线</div>
+        <div class="hint">支持 mp3 / wav / m4a / ogg · 最好的输入是「只有一条人声」的音轨</div>
       </div>
       <input type="file" id="file" accept="audio/*" style="display:none">
+      <div class="hint" style="margin-top:12px;padding:10px 12px;border-left:3px solid var(--mel);background:rgba(127,127,127,.07);border-radius:6px;line-height:1.8">
+        <b>成品歌直接丢进来会跟到伴奏上。</b>人声和吉他、钢琴的泛音是同一套结构，算法分不开这两条线，
+        容易抓成贝斯的根音或分解和弦。想扒成品歌，先把人声单独分离出来 ——
+        用 <b>mvsep.com</b> 或 <b>vocalremover.org</b>（都免费，选人声/伴奏分离，下载 vocals 那轨），
+        拿到人声 wav 再拖进来，<b>分析方式选「单音 / 清唱」</b>。
+      </div>
       <div class="row mt">
         <button class="btn primary" id="btnDemo">用内置示例试一下</button>
         <span class="hint">不需要准备文件 —— 会用一段合成旋律跑完整流程</span>
@@ -241,14 +247,15 @@ E|-----------|"></textarea>
         <label class="field">分析方式
           <select id="amode">
             <option value="song">歌曲（带伴奏，抓主旋律）</option>
-            <option value="mono">单音 / 清唱（节奏更细）</option>
+            <option value="mono">单音 / 清唱（分离后的人声用这个）</option>
           </select>
         </label>
         <label class="field">音域范围
           <select id="range">
-            <option value="110,1400">中高音（人声/吉他，推荐）</option>
-            <option value="70,1400">全音域（会抓到低音）</option>
-            <option value="180,1600">只抓高音（女声/小提琴）</option>
+            <option value="230,720" selected>人声主旋律（A#3–F#5）</option>
+            <option value="196,590">偏低（G3–D5，男声主歌）</option>
+            <option value="293,880">偏高（D4–A5，女声）</option>
+            <option value="80,1200">全音域（会跟到贝斯）</option>
           </select>
         </label>
         <span class="hint" id="audioMeta"></span>
@@ -357,7 +364,7 @@ E|-----------|"></textarea>
   </section>
 
   <footer>
-    <div>快捷键：<kbd>空格</kbd> 播放 / 停止 · 分声部用「音高优先 + 平滑度」动态规划，识旋律用「谐波显著度 + Viterbi 全局路径」，识别歪了的音直接点一下就改了。</div>
+    <div>快捷键：<kbd>空格</kbd> 播放 / 停止 · 分声部用「音高优先 + 平滑度」动态规划，识旋律用「谐波显著度 + 低频对消 + Viterbi 全局路径」，识别歪了的音直接点一下就改了。</div>
     <div style="margin-top:6px">全部计算在本地浏览器完成，音频和谱子不会上传到任何地方。</div>
   </footer>
 </div>
@@ -1897,18 +1904,21 @@ E|-----------|"></textarea>
   // 这里改成两步：① 给每帧每个候选音算谐波显著度；② 用一条全局代价最小的路径
   // 把它们串起来 —— 音程平滑优先，八度跳进重罚。得到的就是一条连贯的主旋律线。
   function analyzeMelody(x, sr, minF, maxF, onProgress, done){
-    var W = 2048, HOP = 256;
+    // 4096 点：低频分辨率 2.7Hz，才找得准贝斯的基频。
+    // 2048 点时 40Hz 附近一共只有 7 个 bin，对消会削偏，反而伤到人声。
+    var W = 4096, HOP = 256;
     var nFrames = Math.max(0, Math.floor((x.length - W) / HOP));
     var win = new Float32Array(W);
     for (var i = 0; i < W; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (W - 1));
 
     var re = new Float64Array(W), im = new Float64Array(W);
-    var mag = new Float32Array(W / 2);
+    var mag = new Float32Array(W / 2);    // 原始谱
+    var mag2 = new Float32Array(W / 2);   // 减掉低频声部后的谱
     var binHz = sr / W;
 
-    // 状态 = 半音。往下多留一个八度，专门用来压制「低音的八度泛音」
-    var lowExtra = 12;
-    var m0 = Math.round(69 + 12 * Math.log2(minF / 440)) - lowExtra;
+    var lowExtra = 0;
+    var frameMax = 0;
+    var m0 = Math.round(69 + 12 * Math.log2(minF / 440));
     var m1 = Math.round(69 + 12 * Math.log2(maxF / 440));
     if (m1 <= m0) return done([]);
     var nStates = m1 - m0 + 1;
@@ -1926,6 +1936,39 @@ E|-----------|"></textarea>
     var samp = new Float32Array(256);
     var sal = new Float32Array(nStates);
     var f = 0, batch = 96;
+
+    // 减掉一个基频的整条谐波列（含 ±宽度，因为谱峰不是一根线）
+    var half = W / 2;
+    function cancelOne(f0, amp){
+      for (var h = 1; h <= 16; h++){
+        var fh = f0 * h;
+        if (fh > sr * 0.47) break;
+        var kk = Math.round(fh / binHz);
+        if (kk < 2 || kk >= half - 1) break;
+        var wd = Math.max(1, Math.round(1.1 * h));
+        for (var d = -wd; d <= wd; d++){
+          var idx = kk + d;
+          if (idx < 2 || idx >= half - 1) continue;
+          var sub = amp * (1 / h) * (1 - Math.abs(d) / (wd + 1));
+          mag2[idx] = mag2[idx] > sub ? mag2[idx] - sub : 0;
+        }
+      }
+    }
+    // 反复挑最响的低频峰减掉，最多 3 个（贝斯 + 底鼓 + 低音吉他）
+    function cancelLowTones(){
+      var lo = Math.max(2, Math.round(35 / binHz));
+      var hi = Math.min(half - 2, Math.round(165 / binHz));
+      for (var pass = 0; pass < 3; pass++){
+        var bk = -1, bv = 0;
+        for (var kq = lo; kq <= hi; kq++){
+          if (mag2[kq] > mag2[kq - 1] && mag2[kq] >= mag2[kq + 1] && mag2[kq] > bv){
+            bv = mag2[kq]; bk = kq;
+          }
+        }
+        if (bk < 0 || bv < frameMax * 0.15) break;
+        cancelOne(bk * binHz, bv * 0.85);
+      }
+    }
 
     function stepFrames(){
       var end = Math.min(nFrames, f + batch);
@@ -1950,9 +1993,17 @@ E|-----------|"></textarea>
         var floorMag = sub[sub.length >> 2] * 0.85;
 
         var maxH = 8;
-        var frameMax = 0;
+        frameMax = 0;
         for (var kx = 2; kx < W / 2 - 2; kx++) if (mag[kx] > frameMax) frameMax = mag[kx];
         var refMag = Math.max(1e-6, frameMax * 0.05);
+
+        // ---- 低频谐波对消 ----
+        // 贝斯的基频加上它那一整排泛音，会把人声的基频「盖」在谐波位置上，
+        // 光比显著度永远分不开。先把 35–165Hz 的强峰当低音声部，
+        // 整条谐波列从谱里减掉，剩下的才是人声。
+        for (var kc = 2; kc < W / 2 - 1; kc++) mag2[kc] = mag[kc];
+        cancelLowTones();
+
         for (var s = 0; s < nStates; s++){
           var f0 = 440 * Math.pow(2, (m0 + s - 69) / 12);
           var sum = 0, wsum = 0, used = 0;
@@ -1964,7 +2015,7 @@ E|-----------|"></textarea>
             for (var d = -2; d <= 2; d++){
               var idx = kk + d;
               if (idx > 1 && idx < W / 2 - 1){
-                var mm = mag[idx] - floorMag;
+                var mm = mag2[idx] - floorMag;
                 if (mm > pm) pm = mm;
               }
             }
@@ -1976,32 +2027,16 @@ E|-----------|"></textarea>
           // 谐波齐全度：低音能凑齐 8 根，高音在 5.5kHz 以上本来就少，做个温和修正
           sal[s] = wsum > 0 ? (sum / wsum) * (0.7 + 0.3 * Math.min(1, used / 5)) : 0;
         }
-        // 若某音的「一半频率」处也有强能量，说明它其实是低一个八度的泛音
-        for (var s2 = nStates - 1; s2 >= lowExtra; s2--){
-          var pv = sal[s2 - lowExtra] * 0.20;
+        // 低一个八度处仍有能量，说明本候选可能是它的泛音（对消后的残留）
+        for (var s2 = nStates - 1; s2 >= lowExtra + 12; s2--){
+          var pv = sal[s2 - 12] * 0.10;
           if (sal[s2] > pv) sal[s2] -= pv; else sal[s2] = 0;
         }
 
         var mx = 0;
         for (var s3 = lowExtra; s3 < nStates; s3++) if (sal[s3] > mx) mx = sal[s3];
         if (mx < 1e-5){ VO[f] = 0; continue; }
-        for (var s4 = 0; s4 < nStates; s4++) sal[s4] = s4 >= lowExtra ? sal[s4] / mx : 0;
-
-        // 上层声部竞争：高音区里有同样强的「另一个音」时，压低本候选。
-        // 流行歌的主旋律基本在最上层；但要跳过 2/3/4 倍频关系，
-        // 否则会把某根特别响的泛音当成更高的声部。
-        for (var s5 = nStates - 1; s5 >= lowExtra; s5--){
-          var hiSal = 0;
-          for (var p3 = s5 + 1; p3 <= Math.min(nStates - 1, s5 + 24); p3++){
-            var gap = p3 - s5;
-            if (gap >= 10 && gap <= 13) continue;   // 八度
-            if (gap >= 18 && gap <= 20) continue;   // 三倍频
-            if (gap >= 23 && gap <= 25) continue;   // 四倍频
-            if (sal[p3] > hiSal) hiSal = sal[p3];
-          }
-          var keep = hiSal > 0.35 ? 1 - 0.55 * Math.min(1, hiSal) : 1;
-          EM[base + s5] = Math.min(1, sal[s5] * (keep < 0.05 ? 0.05 : keep));
-        }
+        for (var s4 = lowExtra; s4 < nStates; s4++) EM[base + s4] = sal[s4] / mx;
       }
 
       if (onProgress) onProgress(0.85 * f / Math.max(1, nFrames));
@@ -2024,7 +2059,7 @@ E|-----------|"></textarea>
           var best = NEG, arg = c;
           for (var p = lowExtra; p < nStates; p++){
             var d = c - p; if (d < 0) d = -d;
-            var pen = d === 0 ? 0 : 0.35 * d + 0.09 * d * d;
+            var pen = d === 0 ? 0 : 0.20 * d + 0.03 * d * d;
             var val = prev[p] - pen;
             if (val > best){ best = val; arg = p; }
           }
