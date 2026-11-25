@@ -1,8 +1,13 @@
 # 练耳扒谱助手 · Guitar Ear Training
 
+[![在线试用](https://img.shields.io/badge/在线试用-guitar--ear--training-2ea44f?style=flat-square)](https://42-beep.github.io/guitar-ear-training/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+
 > 给吉他初学者的练耳扒谱工具：**把别人的指弹谱拆成旋律和伴奏，听一段音频提取出主旋律，再把旋律编配成自己能弹的谱子。**
 
 纯前端、零依赖、单文件。打开 `index.html` 就能用，不联网、不上传、不需要任何 API Key。
+
+**在线使用 → https://42-beep.github.io/guitar-ear-training/**
 
 ---
 
