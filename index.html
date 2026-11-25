@@ -47,6 +47,7 @@ h1 .dot{color:var(--mel);}
 .panel.on{display:block;animation:fade .22s ease;}
 @keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:20px 22px;margin-bottom:18px;}
+.card.drop-over{outline:2px dashed var(--mel);outline-offset:-8px;background:#fffaf4;}
 .card h2{font-size:14px;margin:0 0 14px;font-weight:650;letter-spacing:.06em;color:var(--muted);text-transform:uppercase;}
 textarea{
   width:100%;min-height:190px;resize:vertical;border:1px solid var(--line);border-radius:9px;
@@ -154,8 +155,10 @@ E|-----------|"></textarea>
       <div class="row mt">
         <button class="btn primary" id="btnParse">解析并分声部</button>
         <button class="btn ghost" id="btnSample">载入示例</button>
+        <button class="btn ghost" id="btnOpenTxt">打开 .txt 文件</button>
         <button class="btn ghost" id="btnClear">清空</button>
-        <span class="hint" style="margin-left:auto">按标准调弦（EADGBE）、6 行一组的格式解析，同一列的多个音视为和弦</span>
+        <input type="file" id="txtFile" accept=".txt,.tab,.text,text/plain" style="display:none">
+        <span class="hint" style="margin-left:auto">按标准调弦（EADGBE）、6 行一组解析，同一列的多个音视为和弦；也可以把 .txt 直接拖进来</span>
       </div>
     </div>
 
@@ -369,14 +372,17 @@ E|-----------|"></textarea>
 
   function isTabLine(line){
     var t = line.trim();
-    if (t.length < 5) return false;
-    // 关键：空弦行全是横线、没有数字，也必须被认成谱行
-    if (!/-{3,}/.test(t)) return false;
-    var stripped = t
-      .replace(/^[a-gA-G1-7]\s*[|\]]/, '')
+    if (t.length < 4) return false;
+    if (t.indexOf('-') < 0) return false;
+    // 去掉开头的弦名标签，例如 "e|" "E |" "1]"
+    var body = t.replace(/^([a-gA-G]|[1-7])\s*[|\]]/, '');
+    // 剩下的必须只由「横线 + 品位数字 + 技巧记号」组成
+    var stripped = body
       .replace(/[0-9]/g, '')
       .replace(/[-|hpbrstxXHPBRST/\\~()\s.\]\[<>]/g, '');
-    return stripped.length === 0;
+    if (stripped.length) return false;
+    // 至少要有 | 或数字，排除 "-----" 这种纯分隔线
+    return /[|0-9]/.test(body);
   }
 
   function tabContent(line){
@@ -1459,6 +1465,84 @@ E|-----------|"></textarea>
     $('#tabInput').value = C.buildSampleTab();
     var r = $('#tabResult');
     doParse();
+  });
+
+  // ---------- .txt 谱文件载入 ----------
+  function decodeText(buf){
+    var u8 = new Uint8Array(buf);
+    if (u8.length > 2 && u8[0] === 0xEF && u8[1] === 0xBB && u8[2] === 0xBF){
+      return new TextDecoder('utf-8').decode(u8.subarray(3));
+    }
+    if (u8.length > 2 && u8[0] === 0xFF && u8[1] === 0xFE){
+      return new TextDecoder('utf-16le').decode(u8.subarray(2));
+    }
+    var utf8 = new TextDecoder('utf-8').decode(u8);
+    var bad8 = (utf8.match(/\uFFFD/g) || []).length;
+    if (!bad8) return utf8;
+    // 记事本默认存的 GBK，UTF-8 解出来会有替换符，换 GBK 再试
+    try {
+      var gbk = new TextDecoder('gbk').decode(u8);
+      if ((gbk.match(/\uFFFD/g) || []).length < bad8) return gbk;
+    } catch (e) {}
+    return utf8;
+  }
+
+  function loadTabFile(file){
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024){
+      alert('文件超过 4MB 了，一首谱不会这么大，确认一下是不是选错了文件。');
+      return;
+    }
+    var isText = /\.(txt|tab|text)$/i.test(file.name) || file.type.indexOf('text') === 0;
+    if (!isText){
+      alert('目前只能读文本谱（.txt / .tab）。\n图片谱（.png / .jpg）不能直接识别，需要拍成谱后手动对照输入。');
+      return;
+    }
+    var fr = new FileReader();
+    fr.onload = function(){
+      var txt = decodeText(fr.result).replace(/\r\n?/g, '\n');
+      if (!/[0-9]/.test(txt) || !/-{2,}/.test(txt)){
+        alert('这个文件里没找到六线谱。\n需要是带横线和品位的文本，比如：\ne|--0--|\nB|--1--|');
+        return;
+      }
+      $('#tabInput').value = txt;
+      doParse();
+      var r = $('#tabResult');
+      if (r && r.scrollIntoView) r.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+    fr.onerror = function(){ alert('文件读取失败，换个文件试试。'); };
+    fr.readAsArrayBuffer(file);
+  }
+
+  $('#btnOpenTxt').addEventListener('click', function(){ $('#txtFile').click(); });
+  $('#txtFile').addEventListener('change', function(e){
+    var f = e.target.files && e.target.files[0];
+    loadTabFile(f);
+    e.target.value = '';
+  });
+
+  // 拖放 .txt 到第①页的输入卡片
+  var tabCard = $('#tabInput').closest('.card');
+  ['dragenter', 'dragover'].forEach(function(ev){
+    tabCard.addEventListener(ev, function(e){
+      e.preventDefault(); e.stopPropagation();
+      tabCard.classList.add('drop-over');
+    });
+  });
+  tabCard.addEventListener('dragleave', function(e){
+    if (e.relatedTarget && tabCard.contains(e.relatedTarget)) return;
+    tabCard.classList.remove('drop-over');
+  });
+  tabCard.addEventListener('drop', function(e){
+    e.preventDefault(); e.stopPropagation();
+    tabCard.classList.remove('drop-over');
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]){
+      loadTabFile(e.dataTransfer.files[0]);
+    }
+  });
+  // 拖到页面空白处时，别让浏览器把它当网页打开
+  ['dragover', 'drop'].forEach(function(ev){
+    window.addEventListener(ev, function(e){ e.preventDefault(); }, false);
   });
   $('#btnClear').addEventListener('click', function(){
     $('#tabInput').value = '';
