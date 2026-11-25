@@ -224,7 +224,7 @@ E|-----------|"></textarea>
       <h2>上传音频</h2>
       <div class="drop" id="drop">
         <div class="big">点这里选文件，或把音频拖进来</div>
-        <div class="hint">支持 mp3 / wav / m4a / ogg · 清唱、单件乐器、简单的弹唱效果最好</div>
+        <div class="hint">支持 mp3 / wav / m4a / ogg · 整首歌丢进来就行，会挑出最连贯的那条主旋律线</div>
       </div>
       <input type="file" id="file" accept="audio/*" style="display:none">
       <div class="row mt">
@@ -238,6 +238,12 @@ E|-----------|"></textarea>
       </div>
       <div class="bar" id="prog"><i></i></div>
       <div class="row mt">
+        <label class="field">分析方式
+          <select id="amode">
+            <option value="song">歌曲（带伴奏，抓主旋律）</option>
+            <option value="mono">单音 / 清唱（节奏更细）</option>
+          </select>
+        </label>
         <label class="field">音域范围
           <select id="range">
             <option value="110,1400">中高音（人声/吉他，推荐）</option>
@@ -351,7 +357,7 @@ E|-----------|"></textarea>
   </section>
 
   <footer>
-    <div>快捷键：<kbd>空格</kbd> 播放 / 停止 · 旋律判定用的是「音高优先 + 平滑度」动态规划，被拆错的音直接点一下就改了。</div>
+    <div>快捷键：<kbd>空格</kbd> 播放 / 停止 · 分声部用「音高优先 + 平滑度」动态规划，识旋律用「谐波显著度 + Viterbi 全局路径」，识别歪了的音直接点一下就改了。</div>
     <div style="margin-top:6px">全部计算在本地浏览器完成，音频和谱子不会上传到任何地方。</div>
   </footer>
 </div>
@@ -1885,9 +1891,180 @@ E|-----------|"></textarea>
     step();
   }
 
-  function medianFilter(frames){
+  // ---- 歌曲主旋律追踪：谐波显著度 + Viterbi 全局路径 ----
+  // analyzePitch 逐帧找「最像基频的音」，适合单音源；一旦有人声+伴奏，
+  // 贝斯和和弦根音的泛音序列和主旋律长得一样，逐帧判断必然来回跳。
+  // 这里改成两步：① 给每帧每个候选音算谐波显著度；② 用一条全局代价最小的路径
+  // 把它们串起来 —— 音程平滑优先，八度跳进重罚。得到的就是一条连贯的主旋律线。
+  function analyzeMelody(x, sr, minF, maxF, onProgress, done){
+    var W = 2048, HOP = 256;
+    var nFrames = Math.max(0, Math.floor((x.length - W) / HOP));
+    var win = new Float32Array(W);
+    for (var i = 0; i < W; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (W - 1));
+
+    var re = new Float64Array(W), im = new Float64Array(W);
+    var mag = new Float32Array(W / 2);
+    var binHz = sr / W;
+
+    // 状态 = 半音。往下多留一个八度，专门用来压制「低音的八度泛音」
+    var lowExtra = 12;
+    var m0 = Math.round(69 + 12 * Math.log2(minF / 440)) - lowExtra;
+    var m1 = Math.round(69 + 12 * Math.log2(maxF / 440));
+    if (m1 <= m0) return done([]);
+    var nStates = m1 - m0 + 1;
+
+    var EM = new Float32Array(nFrames * nStates);  // 归一化显著度 0..1
+    var VO = new Uint8Array(nFrames);              // 该帧是否有能量
+
+    var peakAmp = 0;
+    for (var pa = 0; pa < x.length; pa += 7){
+      var av = Math.abs(x[pa]);
+      if (av > peakAmp) peakAmp = av;
+    }
+    var ampGate = Math.max(0.006, peakAmp * 0.022);
+
+    var samp = new Float32Array(256);
+    var sal = new Float32Array(nStates);
+    var f = 0, batch = 96;
+
+    function stepFrames(){
+      var end = Math.min(nFrames, f + batch);
+      for (; f < end; f++){
+        var off = f * HOP;
+        var rms = 0;
+        for (var i2 = 0; i2 < W; i2++){ var v = x[off + i2]; rms += v * v; }
+        rms = Math.sqrt(rms / W);
+        var base = f * nStates;
+
+        if (rms < ampGate){ VO[f] = 0; continue; }
+        VO[f] = 1;
+
+        for (var i3 = 0; i3 < W; i3++){ re[i3] = x[off + i3] * win[i3]; im[i3] = 0; }
+        fft(re, im);
+        for (var k = 0; k < W / 2; k++) mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+
+        // 噪声底：粗中位数（25% 分位），压掉稳态伴奏和底噪
+        var ns = 0;
+        for (var q = 2; q < W / 2 - 2 && ns < 256; q += 6){ samp[ns++] = mag[q]; }
+        var sub = Array.prototype.slice.call(samp, 0, ns).sort(function(a, b){ return a - b; });
+        var floorMag = sub[sub.length >> 2] * 0.85;
+
+        var maxH = 8;
+        var frameMax = 0;
+        for (var kx = 2; kx < W / 2 - 2; kx++) if (mag[kx] > frameMax) frameMax = mag[kx];
+        var refMag = Math.max(1e-6, frameMax * 0.05);
+        for (var s = 0; s < nStates; s++){
+          var f0 = 440 * Math.pow(2, (m0 + s - 69) / 12);
+          var sum = 0, wsum = 0, used = 0;
+          for (var h = 1; h <= maxH; h++){
+            var fh = f0 * h;
+            if (fh > sr * 0.47) break;
+            var kk = Math.round(fh / binHz);
+            var pm = 0;
+            for (var d = -2; d <= 2; d++){
+              var idx = kk + d;
+              if (idx > 1 && idx < W / 2 - 1){
+                var mm = mag[idx] - floorMag;
+                if (mm > pm) pm = mm;
+              }
+            }
+            // 对数域累加：泛音「缺一根」比「某根特别响」更能说明这不是基频
+            var w = 1 / h;
+            sum += w * Math.log(1 + (pm > 0 ? pm : 0) / refMag);
+            wsum += w; used++;
+          }
+          // 谐波齐全度：低音能凑齐 8 根，高音在 5.5kHz 以上本来就少，做个温和修正
+          sal[s] = wsum > 0 ? (sum / wsum) * (0.7 + 0.3 * Math.min(1, used / 5)) : 0;
+        }
+        // 若某音的「一半频率」处也有强能量，说明它其实是低一个八度的泛音
+        for (var s2 = nStates - 1; s2 >= lowExtra; s2--){
+          var pv = sal[s2 - lowExtra] * 0.20;
+          if (sal[s2] > pv) sal[s2] -= pv; else sal[s2] = 0;
+        }
+
+        var mx = 0;
+        for (var s3 = lowExtra; s3 < nStates; s3++) if (sal[s3] > mx) mx = sal[s3];
+        if (mx < 1e-5){ VO[f] = 0; continue; }
+        for (var s4 = 0; s4 < nStates; s4++) sal[s4] = s4 >= lowExtra ? sal[s4] / mx : 0;
+
+        // 上层声部竞争：高音区里有同样强的「另一个音」时，压低本候选。
+        // 流行歌的主旋律基本在最上层；但要跳过 2/3/4 倍频关系，
+        // 否则会把某根特别响的泛音当成更高的声部。
+        for (var s5 = nStates - 1; s5 >= lowExtra; s5--){
+          var hiSal = 0;
+          for (var p3 = s5 + 1; p3 <= Math.min(nStates - 1, s5 + 24); p3++){
+            var gap = p3 - s5;
+            if (gap >= 10 && gap <= 13) continue;   // 八度
+            if (gap >= 18 && gap <= 20) continue;   // 三倍频
+            if (gap >= 23 && gap <= 25) continue;   // 四倍频
+            if (sal[p3] > hiSal) hiSal = sal[p3];
+          }
+          var keep = hiSal > 0.35 ? 1 - 0.55 * Math.min(1, hiSal) : 1;
+          EM[base + s5] = Math.min(1, sal[s5] * (keep < 0.05 ? 0.05 : keep));
+        }
+      }
+
+      if (onProgress) onProgress(0.85 * f / Math.max(1, nFrames));
+      if (f < nFrames) setTimeout(stepFrames, 0);
+      else setTimeout(doViterbi, 0);
+    }
+
+    function doViterbi(){
+      var NEG = -1e9, EMW = 1.5;
+      var prev = new Float32Array(nStates);
+      var cur = new Float32Array(nStates);
+      var bp = new Int16Array(nFrames * nStates);
+
+      for (var s = 0; s < nStates; s++) prev[s] = s < lowExtra ? NEG : EM[s] * EMW;
+
+      for (var t = 1; t < nFrames; t++){
+        var b = t * nStates;
+        var voiced = VO[t];
+        for (var c = lowExtra; c < nStates; c++){
+          var best = NEG, arg = c;
+          for (var p = lowExtra; p < nStates; p++){
+            var d = c - p; if (d < 0) d = -d;
+            var pen = d === 0 ? 0 : 0.35 * d + 0.09 * d * d;
+            var val = prev[p] - pen;
+            if (val > best){ best = val; arg = p; }
+          }
+          cur[c] = best + (voiced ? EM[b + c] * EMW : 0);
+          bp[b + c] = arg;
+        }
+        var tmp = prev; prev = cur; cur = tmp;
+      }
+
+      var path = new Uint8Array(nFrames);
+      if (!nFrames) return done([]);
+      var bs = lowExtra, bv = NEG;
+      for (var s2 = lowExtra; s2 < nStates; s2++) if (prev[s2] > bv){ bv = prev[s2]; bs = s2; }
+      for (var t2 = nFrames - 1; t2 >= 0; t2--){
+        path[t2] = bs;
+        bs = bp[t2 * nStates + bs];
+      }
+
+      var out = [];
+      for (var t3 = 0; t3 < nFrames; t3++){
+        var midi = m0 + path[t3];
+        out.push({
+          t: t3 * HOP / sr,
+          dt: HOP / sr,
+          f0: VO[t3] ? 440 * Math.pow(2, (midi - 69) / 12) : 0,
+          conf: VO[t3] ? 0.55 + 0.45 * EM[t3 * nStates + path[t3]] : 0,
+          rms: 0
+        });
+      }
+      if (onProgress) onProgress(1);
+      done(out);
+    }
+
+    if (!nFrames) return done([]);
+    stepFrames();
+  }
+
+  function medianFilter(frames, winSize){
     var out = frames.map(function(fr){ return fr; });
-    var win = 5;
+    var win = winSize || 5;
     for (var i = 0; i < frames.length; i++){
       if (!frames[i].f0) continue;
       var vals = [];
@@ -1896,7 +2073,7 @@ E|-----------|"></textarea>
       }
       if (!vals.length) continue;
       vals.sort(function(a,b){ return a - b; });
-      out[i] = { t: frames[i].t, f0: vals[Math.floor(vals.length/2)], conf: frames[i].conf, rms: frames[i].rms };
+      out[i] = { t: frames[i].t, f0: vals[Math.floor(vals.length/2)], conf: frames[i].conf, rms: frames[i].rms, dt: frames[i].dt };
     }
     return out;
   }
@@ -1919,7 +2096,7 @@ E|-----------|"></textarea>
       var d = p - med;
       if (Math.abs(d) > 7){
         var np = p - Math.round(d / 12) * 12;
-        out[i] = { t: frames[i].t, f0: 440 * Math.pow(2, (np - 69) / 12), conf: frames[i].conf, rms: frames[i].rms };
+        out[i] = { t: frames[i].t, f0: 440 * Math.pow(2, (np - 69) / 12), conf: frames[i].conf, rms: frames[i].rms, dt: frames[i].dt };
       }
     }
     return out;
@@ -1944,18 +2121,19 @@ E|-----------|"></textarea>
 
     for (var i = 0; i < frames.length; i++){
       var fr = frames[i];
+      var step = fr.dt || 0.011;
       if (!fr.f0 || fr.conf < 0.45){ close(); continue; }
       var midi = 69 + 12 * Math.log2(fr.f0 / 440);
       if (!cur){
-        cur = { start: fr.t, end: fr.t + 0.011, midi: midi, pitches: [midi], confSum: fr.conf, n: 1, midiMed: midi };
+        cur = { start: fr.t, end: fr.t + step, midi: midi, pitches: [midi], confSum: fr.conf, n: 1, midiMed: midi };
       } else if (Math.abs(midi - cur.midiMed) < 0.75){
         cur.pitches.push(midi);
         cur.midiMed = cur.pitches.slice().sort(function(a,b){ return a-b; })[Math.floor(cur.pitches.length/2)];
-        cur.end = fr.t + 0.011;
+        cur.end = fr.t + step;
         cur.confSum += fr.conf; cur.n++;
       } else {
         close();
-        cur = { start: fr.t, end: fr.t + 0.011, midi: midi, pitches: [midi], confSum: fr.conf, n: 1, midiMed: midi };
+        cur = { start: fr.t, end: fr.t + step, midi: midi, pitches: [midi], confSum: fr.conf, n: 1, midiMed: midi };
       }
     }
     close();
@@ -2114,18 +2292,21 @@ E|-----------|"></textarea>
 
     var range = $('#range').value.split(',');
     var minF = +range[0], maxF = +range[1];
+    var songMode = $('#amode').value !== 'mono';
 
     $('#audioMeta').textContent = name + ' · ' + buf.duration.toFixed(1) + 's · ' + (sr0/1000).toFixed(1) + 'kHz';
     var prog = $('#prog');
     prog.classList.add('on');
     prog.firstElementChild.style.width = '0%';
 
+    var engine = songMode ? analyzeMelody : analyzePitch;
+
     setTimeout(function(){
-      analyzePitch(x, target, minF, maxF, function(p){
+      engine(x, target, minF, maxF, function(p){
         prog.firstElementChild.style.width = (p * 100).toFixed(0) + '%';
       }, function(frames){
         prog.firstElementChild.style.width = '100%';
-        frames = fixFrameOctaves(medianFilter(frames));
+        frames = fixFrameOctaves(medianFilter(frames, songMode ? 3 : 5));
         var notes = framesToNotes(frames);
         prog.classList.remove('on');
         if (!notes.length){
@@ -2304,6 +2485,9 @@ E|-----------|"></textarea>
 
   $('#range').addEventListener('change', function(){
     if (state.audio) $('#audioMeta').textContent = '改了音域范围，请重新拖入文件分析。';
+  });
+  $('#amode').addEventListener('change', function(){
+    if (state.audio) $('#audioMeta').textContent = '改了分析方式，请重新拖入文件分析。';
   });
 
   // ================= 面板 3：旋律 → 指弹谱 =================
